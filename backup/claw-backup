@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# claw-backup: OpenClaw 状態 + ブリッジ台帳 + /etc/claw-hub を 1 本にまとめ、
+# age で暗号化して rclone で VM 外へ送る（F-08）。root で実行（claw-backup.service から起動）。
+#
+# 秘密鍵は VM に置かない。/etc/claw-hub/backup-recipients.txt には age の「公開鍵」だけを書く。
+# 復元手順は README.md「復旧」を参照。
+set -euo pipefail
+umask 077
+
+# shellcheck disable=SC1091
+source /etc/claw-hub/backup.env
+: "${GATEWAY_USER:?}" "${OPENCLAW_BIN:?}" "${BACKUP_RCLONE_DEST:?}" "${BACKUP_KEEP_DAYS:=30}"
+RECIPIENTS=/etc/claw-hub/backup-recipients.txt
+RCLONE_CONF=/etc/claw-hub/secrets/rclone-backup.conf
+[[ -s "$RECIPIENTS" ]] || { echo "no age recipients in $RECIPIENTS" >&2; exit 78; }
+[[ -s "$RCLONE_CONF" ]] || { echo "missing $RCLONE_CONF" >&2; exit 78; }
+
+host="$(hostname -s)"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+work="$(mktemp -d /var/tmp/claw-backup.XXXXXX)"
+trap 'rm -rf "$work"' EXIT
+gw_home="$(getent passwd "$GATEWAY_USER" | cut -d: -f6)"
+gw_uid="$(id -u "$GATEWAY_USER")"
+
+# 1) OpenClaw 公式バックアップ（DB スナップショット・設定・資格情報・ワークスペース）。--verify で整合性検査まで
+install -d -m 0700 -o "$GATEWAY_USER" "$work/openclaw"
+runuser -u "$GATEWAY_USER" -- env -i HOME="$gw_home" USER="$GATEWAY_USER" PATH=/usr/local/bin:/usr/bin:/bin \
+  XDG_RUNTIME_DIR="/run/user/$gw_uid" \
+  "$OPENCLAW_BIN" backup create --verify --output "$work/openclaw"
+
+# 2) ブリッジ台帳（オンラインバックアップ API で一貫したコピー）
+if [[ -f /var/lib/claw-bridge/bridge.sqlite ]]; then
+  sqlite3 /var/lib/claw-bridge/bridge.sqlite ".backup '$work/bridge.sqlite'"
+fi
+
+# 3) claw-hub 設定（secrets 含む。暗号化されるので OK）とジョブ結果のメタデータ
+tar -C / -czf "$work/etc-claw-hub.tar.gz" etc/claw-hub
+if [[ -d /srv/claw/jobs ]]; then
+  # 作業ツリー本体は含めず、ジョブの記録（誰が・何を・結果どうなったか）だけ残す
+  find /srv/claw/jobs -mindepth 2 -maxdepth 2 \( -name job.json -o -name result.json \) -printf '%P\0' \
+    | sed -z 's|^|srv/claw/jobs/|' > "$work/job-files.list"
+  if [[ -s "$work/job-files.list" ]]; then
+    tar -C / --null -T "$work/job-files.list" -czf "$work/job-results.tar.gz"
+  fi
+fi
+
+# 4) まとめて暗号化
+bundle="claw-backup-${host}-${stamp}.tar.age"
+parts=(openclaw etc-claw-hub.tar.gz)
+[[ -f "$work/bridge.sqlite" ]] && parts+=(bridge.sqlite)
+[[ -f "$work/job-results.tar.gz" ]] && parts+=(job-results.tar.gz)
+tar -C "$work" -cf - "${parts[@]}" | age -R "$RECIPIENTS" -o "$work/$bundle"
+size="$(stat -c %s "$work/$bundle")"
+
+# 5) VM 外へ転送し、届いたサイズを確認
+rclone copyto "$work/$bundle" "$BACKUP_RCLONE_DEST/$bundle" --config "$RCLONE_CONF" --retries 3 --quiet
+remote_size="$(rclone size --json "$BACKUP_RCLONE_DEST/$bundle" --config "$RCLONE_CONF" | jq -r .bytes)"
+[[ "$remote_size" == "$size" ]] || { echo "size mismatch after upload: local=$size remote=$remote_size" >&2; exit 1; }
+
+# 6) 保持期間を過ぎた古いバックアップを削除（最新 1 本は必ず残る: 今アップロードしたもの）
+rclone delete "$BACKUP_RCLONE_DEST" --config "$RCLONE_CONF" --min-age "${BACKUP_KEEP_DAYS}d" \
+  --include 'claw-backup-*.tar.age' --quiet
+
+echo "backup ok: $bundle ($size bytes) -> $BACKUP_RCLONE_DEST"

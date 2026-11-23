@@ -1,0 +1,301 @@
+#!/usr/bin/python3 -I
+"""claw-run: AI コーディング CLI を「必要な時だけ・隔離して・必ず終わらせる」ためのラッパー。
+
+root 所有で /usr/local/sbin/claw-run に置き、Gateway ユーザーには sudoers で
+このパスだけを NOPASSWD 許可する（bootstrap/30-runner.sh）。
+
+  sudo -n claw-run --agent codex --repo myapp --prompt-file nightly.md
+  echo "READMEの誤字を直して" | sudo -n claw-run --agent claude --repo myapp
+  claw-run --agent codex --repo myapp --prompt-file nightly.md --dry-run   # 実行内容の確認
+
+隔離の中身（systemd の一時サービスとして起動）:
+  - 専用ユーザー clawrun（Gateway ユーザーの ~/.openclaw やトークンは見えない）
+  - ProtectSystem=strict / ProtectHome=tmpfs: 書けるのはジョブディレクトリと CLI 自身の認証ディレクトリだけ
+  - MemoryMax / CPUQuota / TasksMax / RuntimeMaxSec: 2 OCPU / 12GB の VM を食い潰さない
+  - --collect: 終了後にユニットを残さない（F-05）
+  - 同時実行は 1 本（flock）。混雑時は終了コード 75 で即座に返す
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import fcntl
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CONFIG_FILE = Path("/etc/claw-hub/runner.json")
+
+DEFAULTS = {
+    "run_user": "clawrun",
+    "jobs_root": "/srv/claw/jobs",
+    "repos_root": "/srv/claw/repos",
+    "prompts_root": "/etc/claw-hub/prompts",
+    "lock_file": "/run/claw-run.lock",
+    "max_prompt_bytes": 65536,
+    "default_timeout_sec": 1800,
+    "max_timeout_sec": 7200,
+    "limits": {"MemoryMax": "3G", "MemorySwapMax": "0", "CPUQuota": "150%", "TasksMax": "256"},
+    "agents": {
+        # argv テンプレート。{prompt} は使わない（プロンプトは常に stdin で渡し、ps に出さない）
+        # CLI のフラグはバージョンで変わるので、導入時に `<cli> --help` で確認して runner.json で上書きする
+        "codex": {
+            "enabled": True,
+            "argv": ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write",
+                     "--json", "--output-last-message", "{job_dir}/last-message.txt", "-"],
+            "state_dirs": [".codex"],
+            "state_files": [],
+        },
+        "claude": {
+            "enabled": True,
+            "argv": ["claude", "-p", "--output-format", "json", "--permission-mode", "acceptEdits"],
+            "state_dirs": [".claude"],
+            "state_files": [".claude.json"],
+        },
+        "gemini": {
+            # Google は 2026-06-18 に個人向け Gemini CLI の Google ログインを終了。
+            # AI Studio の API キー（GEMINI_API_KEY）経由のみ。課金設定のないキーで無料枠に留めること
+            "enabled": False,
+            "argv": ["gemini", "-p", "-", "--output-format", "json"],
+            "state_dirs": [".gemini"],
+            "state_files": [],
+            "env_file": "/etc/claw-hub/runner-secrets/gemini.env",
+        },
+    },
+}
+
+JOB_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,47}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+EX_USAGE, EX_TEMPFAIL, EX_CONFIG = 64, 75, 78
+
+
+class UsageError(Exception):
+    pass
+
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULTS))
+    if CONFIG_FILE.exists():
+        st = CONFIG_FILE.stat()
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            raise UsageError(f"{CONFIG_FILE} must be root-owned and not group/world-writable")
+        user = json.loads(CONFIG_FILE.read_text())
+        for k, v in user.items():
+            if k == "agents":
+                for name, a in v.items():
+                    cfg["agents"].setdefault(name, {}).update(a)
+            elif k == "limits":
+                cfg["limits"].update(v)
+            else:
+                cfg[k] = v
+    return cfg
+
+
+def within(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def parse_args(argv: list[str], cfg: dict) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="claw-run")
+    p.add_argument("--agent", required=True)
+    p.add_argument("--repo", help=f"<repos_root>/<name> を作業コピーとして clone する")
+    p.add_argument("--job", help="ジョブID（省略時は自動採番）")
+    p.add_argument("--prompt-file", help="<prompts_root> 直下のファイル名（root 管理の定型プロンプト）")
+    p.add_argument("--timeout", type=int, default=cfg["default_timeout_sec"])
+    p.add_argument("--dry-run", action="store_true")
+    a = p.parse_args(argv)
+
+    agent = cfg["agents"].get(a.agent)
+    if not agent or not agent.get("enabled"):
+        raise UsageError(f"agent '{a.agent}' is not enabled")
+    if a.repo is not None and not NAME_RE.match(a.repo):
+        raise UsageError("invalid --repo")
+    if a.job is None:
+        a.job = f"{a.agent}-{_dt.datetime.now(_dt.timezone.utc):%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
+    if not JOB_RE.match(a.job):
+        raise UsageError("invalid --job (lowercase letters, digits, '-', 3-48 chars)")
+    if not (60 <= a.timeout <= cfg["max_timeout_sec"]):
+        raise UsageError(f"--timeout must be 60..{cfg['max_timeout_sec']}")
+    if a.prompt_file is not None:
+        if not NAME_RE.match(a.prompt_file):
+            raise UsageError("--prompt-file must be a plain file name inside prompts_root")
+        path = Path(cfg["prompts_root"]) / a.prompt_file
+        if not path.is_file() or path.is_symlink() or not within(path, Path(cfg["prompts_root"])):
+            raise UsageError(f"prompt file not found: {a.prompt_file}")
+        a.prompt_path = path
+    else:
+        a.prompt_path = None
+    return a
+
+
+def read_prompt(a: argparse.Namespace, cfg: dict, stdin) -> bytes:
+    data = a.prompt_path.read_bytes() if a.prompt_path else stdin.buffer.read(cfg["max_prompt_bytes"] + 1)
+    if not data.strip():
+        raise UsageError("empty prompt (use --prompt-file or pipe it on stdin)")
+    if len(data) > cfg["max_prompt_bytes"]:
+        raise UsageError(f"prompt exceeds {cfg['max_prompt_bytes']} bytes")
+    return data
+
+
+def run_user_home(cfg: dict) -> Path:
+    try:
+        return Path(pwd.getpwnam(cfg["run_user"]).pw_dir)
+    except KeyError:
+        raise UsageError(f"run user '{cfg['run_user']}' does not exist (run bootstrap/30-runner.sh)")
+
+
+def build_unit_argv(a: argparse.Namespace, cfg: dict, job_dir: Path, work_dir: Path) -> list[str]:
+    agent = cfg["agents"][a.agent]
+    home = run_user_home(cfg)
+    props = {
+        "User": cfg["run_user"],
+        "Group": cfg["run_user"],
+        "WorkingDirectory": str(work_dir),
+        "RuntimeMaxSec": str(a.timeout),
+        "NoNewPrivileges": "yes",
+        "ProtectSystem": "strict",
+        "ProtectHome": "tmpfs",
+        "PrivateTmp": "yes",
+        "PrivateDevices": "yes",
+        "ProtectKernelTunables": "yes",
+        "ProtectKernelModules": "yes",
+        "ProtectKernelLogs": "yes",
+        "ProtectControlGroups": "yes",
+        "ProtectClock": "yes",
+        "ProtectHostname": "yes",
+        "RestrictSUIDSGID": "yes",
+        "LockPersonality": "yes",
+        "CapabilityBoundingSet": "",
+        "UMask": "0077",
+        "KillMode": "control-group",
+        "TimeoutStopSec": "30",
+        **cfg["limits"],
+    }
+    argv = ["systemd-run", f"--unit=claw-job-{a.job}", "--wait", "--collect", "--pipe", "--quiet",
+            "--service-type=exec"]
+    for k, v in props.items():
+        argv.append(f"--property={k}={v}")
+    argv.append(f"--property=ReadWritePaths={job_dir}")
+    # CLI のログイン状態（トークン更新を含む）だけは書き戻せるように bind する
+    for d in agent.get("state_dirs", []):
+        argv.append(f"--property=BindPaths={home / d}")
+    for f in agent.get("state_files", []):
+        argv.append(f"--property=BindPaths=-{home / f}")
+    env = {"HOME": str(home), "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "CI": "1", "NO_COLOR": "1"}
+    for k, v in env.items():
+        argv.append(f"--setenv={k}={v}")
+    if agent.get("env_file"):
+        argv.append(f"--property=EnvironmentFile={agent['env_file']}")
+    argv.append("--")
+    argv += [x.replace("{job_dir}", str(job_dir)).replace("{work_dir}", str(work_dir)) for x in agent["argv"]]
+    return argv
+
+
+def prepare_job(a: argparse.Namespace, cfg: dict) -> tuple[Path, Path]:
+    jobs_root = Path(cfg["jobs_root"])
+    job_dir = jobs_root / a.job
+    if job_dir.exists():
+        raise UsageError(f"job {a.job} already exists (job IDs are single-use to prevent double execution)")
+    work_dir = job_dir / "work"
+    if a.dry_run:
+        return job_dir, work_dir
+    pw = pwd.getpwnam(cfg["run_user"])
+    job_dir.mkdir(mode=0o700, parents=False)
+    if a.repo:
+        src = Path(cfg["repos_root"]) / a.repo
+        if not (src / ".git").exists() and not (src / "HEAD").exists():
+            raise UsageError(f"repo not found: {a.repo}")
+        subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", str(src), str(work_dir)], check=True)
+    else:
+        work_dir.mkdir(mode=0o700)
+    for root, dirs, files in os.walk(job_dir):
+        for n in dirs + files:
+            os.lchown(os.path.join(root, n), pw.pw_uid, pw.pw_gid)
+    os.chown(job_dir, pw.pw_uid, pw.pw_gid)
+    return job_dir, work_dir
+
+
+def tail(path: Path, n: int = 4000) -> str:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - n))
+            return f.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        return ""
+
+
+def main(argv: list[str], stdin=sys.stdin) -> int:
+    try:
+        cfg = load_config()
+        a = parse_args(argv, cfg)
+        prompt = read_prompt(a, cfg, stdin)
+        if not a.dry_run and os.geteuid() != 0:
+            print(json.dumps({"ok": False, "error": "must run as root (via sudo -n /usr/local/sbin/claw-run)"}), file=sys.stderr)
+            return EX_CONFIG
+        job_dir, work_dir = prepare_job(a, cfg)
+        unit_argv = build_unit_argv(a, cfg, job_dir, work_dir)
+    except UsageError as e:
+        print(json.dumps({"ok": False, "error": str(e)}), file=sys.stderr)
+        return EX_USAGE
+
+    if a.dry_run:
+        print(json.dumps({"job": a.job, "job_dir": str(job_dir), "argv": unit_argv, "prompt_bytes": len(prompt)}, ensure_ascii=False, indent=2))
+        return 0
+
+    if not shutil.which("systemd-run"):
+        print(json.dumps({"ok": False, "error": "systemd-run not found"}), file=sys.stderr)
+        return EX_CONFIG
+
+    lock = open(cfg["lock_file"], "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        print(json.dumps({"ok": False, "error": "another claw-run job is running", "retryable": True}), file=sys.stderr)
+        return EX_TEMPFAIL
+
+    started = _dt.datetime.now(_dt.timezone.utc)
+    meta = {"job": a.job, "agent": a.agent, "repo": a.repo, "prompt_file": a.prompt_file,
+            "timeout_sec": a.timeout, "started_at": started.isoformat()}
+    (job_dir / "job.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+    out_path = job_dir / "output.log"
+    with open(out_path, "wb") as out:
+        proc = subprocess.run(unit_argv, input=prompt, stdout=out, stderr=subprocess.STDOUT)
+    finished = _dt.datetime.now(_dt.timezone.utc)
+
+    # 成果の「事実」: 終了コードと作業ツリーの差分。AI の自己申告とは別に記録する（F-07）
+    diffstat = ""
+    if (work_dir / ".git").exists():
+        r = subprocess.run(["git", "-c", f"safe.directory={work_dir}", "-C", str(work_dir), "status", "--porcelain"],
+                           capture_output=True, text=True)
+        diffstat = r.stdout[-4000:]
+    result = {
+        **meta,
+        "finished_at": finished.isoformat(),
+        "duration_sec": round((finished - started).total_seconds(), 1),
+        "exit_code": proc.returncode,
+        "timed_out": proc.returncode != 0 and (finished - started).total_seconds() >= a.timeout - 1,
+        "changed_files": [l[3:] for l in diffstat.splitlines()],
+        "last_message": tail(job_dir / "last-message.txt", 2000) or None,
+        "output_tail": tail(out_path, 2000),
+    }
+    (job_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps({k: result[k] for k in ("job", "agent", "exit_code", "timed_out", "duration_sec", "changed_files", "last_message")},
+                     ensure_ascii=False))
+    return 0 if proc.returncode == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

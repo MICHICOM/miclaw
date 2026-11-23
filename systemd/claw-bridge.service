@@ -1,0 +1,49 @@
+[Unit]
+Description=claw-hub bridge: ingest cloud-AI results and hand them to the OpenClaw reader agent
+Documentation=file:///opt/claw-hub/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=clawbridge
+Group=clawbridge
+EnvironmentFile=/etc/claw-hub/bridge.env
+# 秘密は環境変数ではなく systemd credentials（このユニットのプロセスからのみ読める）
+LoadCredential=hooks-token:/etc/claw-hub/secrets/hooks-token
+LoadCredential=rclone.conf:/etc/claw-hub/secrets/rclone.conf
+Environment=OPENCLAW_HOOKS_TOKEN_FILE=%d/hooks-token
+StateDirectory=claw-bridge
+StateDirectoryMode=0700
+# 同期に失敗しても、既に受信箱にあるものは処理する
+ExecStartPre=-/opt/claw-hub/bridge/claw-bridge-sync
+ExecStart=/usr/bin/node /opt/claw-hub/bridge/bridge.mjs run
+TimeoutStartSec=1h
+
+# 資源制限（常駐しない oneshot だが念のため）
+MemoryMax=384M
+CPUQuota=50%
+TasksMax=64
+Nice=10
+
+# ハードニング
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+UMask=0077

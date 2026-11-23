@@ -1,0 +1,168 @@
+// claw-hub: OpenClaw 2026.11.x 向けハードニング済み設定パッチ
+//
+// 適用:  bootstrap/20-openclaw.sh が __PLACEHOLDER__ を置換して
+//        `openclaw config patch --file <rendered> --dry-run` → 本適用 の順で流し込む。
+// 検証:  checks/validate-config.sh（OpenClaw 本体のスキーマで dry-run 検証）
+//
+// 方針:
+//  - 管理面は loopback + token + Tailscale Serve のみ（公開ポートなし）
+//  - 秘密情報はすべて SecretRef(env)。平文をこのファイルに書かない
+//  - 「main」= 利用者と話す窓口。サンドボックス内でのみ実行、ホスト実行は毎回承認
+//  - 「reader」= 外部由来データ（ブリッジ経由のクラウドAI成果物等）専用。ツールほぼ無し
+{
+  gateway: {
+    mode: "local",
+    bind: "loopback",
+    port: 18789,
+    auth: {
+      mode: "token",
+      token: { source: "env", provider: "default", id: "OPENCLAW_GATEWAY_TOKEN" },
+      // 同一ホストで非信頼コードが動き得るため、Tailscale ID ヘッダだけでの認証は無効化
+      allowTailscale: false,
+    },
+    tailscale: { mode: "serve" },
+    // Tailscale Serve のローカルプロキシ用（auth.mode=trusted-proxy ではない）
+    trustedProxies: ["127.0.0.1"],
+  },
+
+  session: {
+    dmScope: "per-channel-peer",
+  },
+
+  commands: {
+    // 自動化の会話管理などオーナー権限を持つ送信者（Discord ユーザーID）
+    ownerAllowFrom: ["discord:__DISCORD_OWNER_ID__"],
+  },
+
+  channels: {
+    discord: {
+      token: { source: "env", provider: "default", id: "DISCORD_BOT_TOKEN" },
+      dmPolicy: "allowlist",
+      allowFrom: ["discord:__DISCORD_OWNER_ID__"],
+      groupPolicy: "allowlist",
+      guilds: {
+        "__DISCORD_GUILD_ID__": {
+          requireMention: true,
+          ignoreOtherMentions: true,
+          users: ["__DISCORD_OWNER_ID__"],
+          channels: {
+            "__DISCORD_CHANNEL_ID__": { enabled: true },
+          },
+        },
+      },
+    },
+  },
+
+  tools: {
+    profile: "coding",
+    // 制御プレーン系は既定で拒否し、エージェント単位で必要最小限を戻す
+    deny: ["gateway"],
+    fs: { workspaceOnly: true },
+    exec: {
+      // 既定は sandbox 内実行。ホスト実行が必要な場合も allowlist + 毎回承認
+      host: "sandbox",
+      security: "allowlist",
+      ask: "always",
+      timeoutSeconds: 1800,
+    },
+    elevated: { enabled: false },
+    sessions: { visibility: "agent" },
+    agentToAgent: { enabled: false },
+    // tools.gatewayPolicy（モデル主導の全ツールを具体名で許可リスト化）は
+    // 運用が固まってから追加する。docs/spec-v0.2.md §5.3 参照。
+  },
+
+  agents: {
+    // 複数エージェント構成では各入口の担当を明示する（現行仕様。旧 default:true は非推奨）
+    ownership: "explicit",
+    defaults: {
+      systemAgent: { agentId: "main" },
+      authInheritance: { agentId: "main" },
+      userTimezone: "Asia/Tokyo",
+      timeoutSeconds: 1800,
+      maxConcurrent: 2, // 2 OCPU / 12GB 前提
+      sandbox: {
+        mode: "all",
+        // rootless Podman: Gateway ユーザーに root 相当の Docker ソケットを持たせない。
+        // 動かない場合のフォールバックは "docker"（docker グループ = 実質 root である点に注意）
+        backend: "podman",
+        scope: "session",
+        workspaceAccess: "rw",
+        // Podman でも設定キーは sandbox.docker.* を共用する
+        docker: {
+          image: "openclaw-sandbox:trixie-slim",
+          readOnlyRoot: true,
+          tmpfs: ["/tmp", "/var/tmp", "/run"],
+          network: "none",
+          capDrop: ["ALL"],
+          memory: "2g",
+          cpus: 1,
+          pidsLimit: 256,
+        },
+      },
+    },
+    entries: {
+      main: {
+        name: "Coordinator",
+        workspace: "~/.openclaw/workspace",
+        description: "Discord 窓口。受付・進捗通知・ジョブ投入の判断を行う",
+      },
+      reader: {
+        name: "Reader",
+        workspace: "~/.openclaw/workspace-reader",
+        description: "外部由来データ（クラウドAI成果物・Web・メール）を要約・検証するだけの隔離エージェント",
+        tools: {
+          profile: "minimal",
+          deny: [
+            "group:runtime",
+            "group:fs",
+            "group:automation",
+            "sessions_spawn",
+            "sessions_send",
+            "message",
+          ],
+        },
+        sandbox: {
+          mode: "all",
+          workspaceAccess: "none",
+        },
+      },
+    },
+  },
+
+  // Discord からの会話はすべて main が担当。reader はフック経由でしか起動しない
+  bindings: [
+    { agentId: "main", match: { channel: "discord", accountId: "*" } },
+  ],
+
+  hooks: {
+    enabled: true,
+    // Gateway の token とは別の専用トークン
+    // hooks.token は SecretRef 非対応（実行時に書き換わる資格情報のため）。env テンプレートで渡す
+    token: "${OPENCLAW_HOOKS_TOKEN}",
+    path: "/hooks",
+    // ブリッジからは reader にしか投げられない
+    allowedAgentIds: ["reader"],
+    allowRequestSessionKey: false,
+    // フック経由の実行を既知のセッションキーに固定（同一キーは直列実行になる＝2 OCPU では好都合）
+    defaultSessionKey: "hook:bridge",
+    allowedSessionKeyPrefixes: ["hook:"],
+  },
+
+  // 読み込むプラグインを限定（実測: 起動直後 RSS 約2.2GB → 約2.0GB、アイドル時 約1.7GB / x86_64）
+  // discord はチャンネルプラグインとして別途インストールが必要（bootstrap/20-openclaw.sh）
+  plugins: {
+    allow: ["discord", "openai", "anthropic", "google", "memory-core", "device-pair", "workboard"],
+  },
+
+  cron: {
+    enabled: true,
+    failureAlert: {
+      enabled: true,
+      after: 2,
+      mode: "announce",
+      channel: "discord",
+      to: "channel:__DISCORD_CHANNEL_ID__",
+    },
+  },
+}

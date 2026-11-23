@@ -1,0 +1,15 @@
+[Unit]
+Description=claw-hub encrypted off-host backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/claw-backup
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=1G
+TimeoutStartSec=1h
+PrivateTmp=yes
+# openclaw backup はバックアップ試行の記録を ~/.openclaw に書くので ProtectHome は付けない
+ProtectSystem=full

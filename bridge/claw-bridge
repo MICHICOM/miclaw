@@ -1,0 +1,8 @@
+#!/bin/sh
+# 台帳の確認・手動再試行用。取り込みの実行は systemctl start claw-bridge.service を使う。
+#   sudo claw-bridge status [--json]
+#   sudo claw-bridge retry <eventId>
+set -eu
+case "${1:-}" in status|retry) ;; *) echo "usage: claw-bridge status [--json] | retry <eventId>" >&2; exit 64;; esac
+BRIDGE_DB="$(sed -n 's/^BRIDGE_DB=//p' /etc/claw-hub/bridge.env)"
+exec runuser -u clawbridge -- env -i BRIDGE_DB="$BRIDGE_DB" /usr/bin/node /opt/claw-hub/bridge/bridge.mjs "$@"

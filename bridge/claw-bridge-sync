@@ -1,0 +1,17 @@
+#!/bin/sh
+# Drive の受信フォルダ → ローカル受信箱（読み取り専用スコープの rclone で一方向コピー）。
+# rclone.conf が無ければ何もしない（ローカル受信箱だけで運用する場合）。
+set -eu
+conf="${CREDENTIALS_DIRECTORY:-/nonexistent}/rclone.conf"
+# 40-bridge.sh は rclone.conf が無いとき空ファイルを置く（LoadCredential は存在しないパスで失敗するため）
+[ -s "$conf" ] || { echo "rclone.conf not configured; skip sync"; exit 0; }
+[ -n "${BRIDGE_RCLONE_SRC:-}" ] || { echo "BRIDGE_RCLONE_SRC unset; skip sync"; exit 0; }
+mkdir -p "$BRIDGE_INBOX_DIR"
+# 読み取り専用の資格情報ファイルなのでトークン更新の書き戻しは失敗するが、取得自体は継続する
+exec rclone copy "$BRIDGE_RCLONE_SRC" "$BRIDGE_INBOX_DIR" \
+  --config "$conf" \
+  --max-age "${BRIDGE_MAX_AGE_DAYS:-7}d" \
+  --max-size "${BRIDGE_MAX_BYTES:-262144}b" \
+  --include '*.json' --include '*.md' --include '*.txt' \
+  --drive-export-formats txt \
+  --no-traverse --timeout 60s --retries 2 --quiet
