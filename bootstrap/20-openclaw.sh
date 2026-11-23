@@ -14,6 +14,12 @@ ENV_FILE="$STATE/.env"
 [[ $EUID -ne 0 ]] || { echo "do not run as root; run as the gateway user" >&2; exit 1; }
 [[ -f "$IDS_FILE" ]] || { echo "missing $IDS_FILE (copy config/ids.env.example)" >&2; exit 1; }
 
+# sudo -iu / su で入ると user systemd のバスが見えない。linger 済みなら /run/user/$UID がある
+if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
+  XDG_RUNTIME_DIR="/run/user/$(id -u)"; export XDG_RUNTIME_DIR
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+
 step() { printf '\n== %s\n' "$*"; }
 
 step "OpenClaw install"

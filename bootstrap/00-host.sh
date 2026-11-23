@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# OCI Ampere A1 (Ubuntu 24.04 aarch64) のホスト初期化。root で実行する。
+# ホスト初期化（OCI Ampere A1 / Ubuntu 24.04 aarch64 が基準。x86_64 の VPS でも動く）。root で実行する。
 #   sudo ./bootstrap/00-host.sh
+#   sudo GATEWAY_USER=claw ./bootstrap/00-host.sh   # root ログインの VPS（05-gateway-user.sh で作ったユーザー）
 # 何度実行しても同じ結果になる（冪等）。
 set -euo pipefail
 
@@ -25,6 +26,8 @@ apt-get install -y --no-install-recommends \
   rclone age unattended-upgrades
 
 hostnamectl set-hostname "$HOSTNAME_WANTED"
+# cloud-init が /etc/hosts を管理しない VPS で sudo が「unable to resolve host」を出さないように
+grep -qE "^127\.0\.1\.1[[:space:]].*\b${HOSTNAME_WANTED}\b" /etc/hosts || echo "127.0.1.1 ${HOSTNAME_WANTED}" >> /etc/hosts
 # ログアウト後も user systemd（openclaw-gateway.service）を動かし続ける
 loginctl enable-linger "$GATEWAY_USER"
 

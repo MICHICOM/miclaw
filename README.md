@@ -15,7 +15,7 @@ OCI Always Free（Ampere A1, 2 OCPU / 12GB）の 1 台に、OpenClaw を窓口�
 | `backup/claw-backup` | `openclaw backup create --verify` + ブリッジ台帳 + `/etc/claw-hub` を age で暗号化して rclone で VM 外へ |
 | `workspace/*/AGENTS.md` | エージェントの運用ルール（信頼境界・承認が必要な操作・振り分け・報告の仕方） |
 | `systemd/` | ブリッジ / バックアップのユニットとタイマー |
-| `bootstrap/` | 導入スクリプト（00 → 50 の順） |
+| `bootstrap/` | 導入スクリプト（00 → 50 の順。05 / 15 は root ログインの VPS 向け） |
 | `checks/` | 設定のレンダリング、完了判定チェック、テスト一括実行 |
 
 ## 導入
@@ -28,6 +28,53 @@ OCI Always Free（Ampere A1, 2 OCPU / 12GB）の 1 台に、OpenClaw を窓口�
 ### 1. VM 作成
 OCI コンソールで `VM.Standard.A1.Flex`、**2 OCPU / 12GB**、Ubuntu 24.04 (aarch64)、ブートボリューム 50〜100GB。
 （2026 年の改定で Always Free の A1 は常時 2 OCPU / 12GB が上限。OpenClaw 公式手順の「4 OCPU / 24GB」は旧情報）
+
+### 1'. KAGOYA などの VPS（x86_64 / root ログイン）の場合
+OCI の手順との違いは 3 点。ほかは同じ順で進める。
+
+- **CPU**: x86_64 でも動く（`00-host.sh` は警告を出すだけ）。RAM は 4GB 以上（Gateway だけで約 1.7〜2.2GB）
+- **ユーザー**: root でしか入れないなら、Gateway 用の一般ユーザーを作り、全 bootstrap に `GATEWAY_USER=claw` を渡す（`20-openclaw.sh` は root では動かない）。導入中だけ NOPASSWD sudo を付け、最後に外す
+- **ファイアウォール**: VCN の代わりに ufw（`15-firewall.sh`）＋事業者のコントロールパネルで閉じる
+
+```bash
+git clone -b claw-hub https://github.com/MICHICOM/miclaw /root/miclaw && /root/miclaw/bootstrap/05-gateway-user.sh
+```
+
+```bash
+sudo -iu claw
+```
+
+以降は claw で（`sudo` は一時権限）:
+
+```bash
+git clone -b claw-hub https://github.com/MICHICOM/miclaw ~/miclaw && cd ~/miclaw
+```
+
+```bash
+sudo GATEWAY_USER=claw ./bootstrap/00-host.sh
+```
+
+```bash
+sudo GATEWAY_USER=claw ./bootstrap/10-tailscale.sh
+```
+
+```bash
+sudo ./bootstrap/15-firewall.sh
+```
+
+手元 PC から tailnet 経由で `ssh claw@openclaw` できることを確認してから（既に公開中のサービスがあれば `EXTRA_ALLOW="80/tcp 443/tcp"` を付ける）:
+
+```bash
+sudo CLOSE_SSH=1 ./bootstrap/15-firewall.sh
+```
+
+コントロールパネル側のファイアウォールでも **UDP 41641 以外の受信をすべて閉じる**。sshd 自体も止めるなら `CLOSE_SSH=1 STOP_SSHD=1`（以後は Tailscale SSH か事業者のコンソールで入る）。
+
+3 章以降は同じ。root 実行のスクリプトには `GATEWAY_USER=claw` を付ける（例: `sudo GATEWAY_USER=claw INSTALL_CLIS=1 ./bootstrap/30-runner.sh`）。30〜50 が終わったら、root で一時 sudo を外す（40/50 を後回しにした場合は、後で root から `GATEWAY_USER=claw /home/claw/miclaw/bootstrap/40-bridge.sh` のように実行できる）:
+
+```bash
+/root/miclaw/bootstrap/05-gateway-user.sh --finish
+```
 
 ### 2. ホスト・Tailscale
 

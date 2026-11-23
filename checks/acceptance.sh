@@ -9,12 +9,22 @@ ng()   { printf '  \e[31mFAIL\e[0m %s\n' "$*"; fail=$((fail+1)); }
 note() { printf '  \e[33mWARN\e[0m %s\n' "$*"; warn=$((warn+1)); }
 sec()  { printf '\n[%s]\n' "$*"; }
 STATE="$HOME/.openclaw"
+# sudo -iu / su で入ると user systemd のバスが見えない。linger 済みなら /run/user/$UID がある
+if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
+  XDG_RUNTIME_DIR="/run/user/$(id -u)"; export XDG_RUNTIME_DIR
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
 
 sec "A1 管理面がインターネットに出ていない"
 # loopback / Tailscale(100.64/10, fd7a:115c:a1e0::/48) 以外で LISTEN している TCP を探す
 public="$(ss -H -tln | awk '{print $4}' | grep -vE '^(127\.|\[::1\]|\[?::ffff:127\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|\[fd7a:115c:a1e0:)' || true)"
 if [[ -z "$public" ]]; then ok "公開アドレスで LISTEN している TCP ポートなし"; else ng "公開 LISTEN: $(echo $public)"; fi
-if systemctl is-active --quiet ssh 2>/dev/null; then note "sshd が動作中（Tailscale SSH 確認後は無効化推奨）"; else ok "sshd 停止"; fi
+if grep -qs '^ENABLED=yes' /etc/ufw/ufw.conf; then
+  grep -qsE '^DEFAULT_INPUT_POLICY="(DROP|REJECT)"' /etc/default/ufw && ok "ufw 有効・受信は既定 deny" || ng "ufw 有効だが受信の既定が deny でない"
+else
+  note "ufw 無効（OCI は VCN、VPS は bootstrap/15-firewall.sh で閉じる）"
+fi
+if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; then note "sshd が動作中（Tailscale SSH 確認後は無効化推奨）"; else ok "sshd 停止"; fi
 tailscale serve status 2>/dev/null | grep -q 'proxy' && ok "Tailscale Serve 経由で公開" || ng "Tailscale Serve の経路が見つからない"
 tailscale funnel status 2>/dev/null | grep -qi 'funnel on' && ng "Funnel（公開）が有効" || ok "Funnel 無効"
 

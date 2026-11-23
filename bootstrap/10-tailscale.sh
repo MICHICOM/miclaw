@@ -23,4 +23,5 @@ tailscale set --operator="$GATEWAY_USER"
 
 tailscale status | head -5
 echo
-echo "Next: confirm 'ssh ${GATEWAY_USER}@${TS_HOSTNAME}' works over tailnet, then lock the OCI VCN down to UDP 41641 only."
+echo "Next: confirm 'ssh ${GATEWAY_USER}@${TS_HOSTNAME}' works over tailnet, then lock ingress down to UDP 41641 only"
+echo "      (OCI: VCN Security List / VPS: bootstrap/15-firewall.sh + the provider's control-panel firewall)."
