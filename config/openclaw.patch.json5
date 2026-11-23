@@ -78,6 +78,10 @@
     defaults: {
       systemAgent: { agentId: "main" },
       authInheritance: { agentId: "main" },
+      // GPT（Codex サブスク）が使えない時のサブ LLM。キーは ~/.openclaw/.env の GEMINI_API_KEY。
+      // primary は onboarding / `openclaw models set` に任せ、ここではフォールバックだけ指定する。
+      // 使える ID はサーバで `openclaw models list --provider google --refresh` で確認して差し替える
+      model: { fallbacks: ["google/gemini-3.8-flash"] },
       userTimezone: "Asia/Tokyo",
       timeoutSeconds: 1800,
       maxConcurrent: 2, // 2 OCPU / 12GB 前提

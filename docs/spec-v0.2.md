@@ -86,6 +86,7 @@
 | Codex CLI（claw-run） | `clawrun` ユーザーで `codex login --device-auth` | サブスク枠 | 公式（同上）。フラグは CLI 版で変わるため `runner.json` で上書き可 |
 | Claude Code（claw-run） | `clawrun` ユーザーで `/login` または `claude setup-token` | サブスク枠（`claude -p` / Agent SDK はサインイン中プランの上限から消費） | 公式（OpenClaw Anthropic ページが Anthropic のサポート記事を引用）。共有・本番用途は API キー推奨とされる点に注意 |
 | Claude を OpenClaw のモデルとして使う | `claude-cli/*` ルート（同一ホストの Claude Code ログインを再利用） | サブスク枠 | 公式。ただし Claude Code は Gateway ユーザー側に入る＝claw-run の分離が崩れるため**本構成では不採用** |
+| Gemini API（窓口エージェントのサブ LLM） | `agents.defaults.model.fallbacks` に `google/…`、キーは `GEMINI_API_KEY`。GPT が上限・障害の時だけ使われる | 無料枠（課金を有効にしない）。無料枠の入力は製品改善に使われうる | 公式（OpenClaw model failover / Google provider）。サーバから弾かれる件は `checks/gemini-diag.sh` で切り分け |
 | Gemini CLI | AI Studio の API キー（課金未設定のキー＝無料枠）。`runner.json` で `gemini.enabled=true` | 無料枠（課金を有効にしない） | 公式。個人向け Google ログインは 2026-06-18 終了、Antigravity OAuth は**規約上不可** |
 | ChatGPT Work / Claude Cowork / Gemini Spark | 各サービスの UI で定期タスクを登録し、結果を Drive `claw-inbox` へ | 各サブスク | 機能は公式。OpenClaw からの起動 API は**非対応**。Drive への書き出しは**仮説**（§7） |
 

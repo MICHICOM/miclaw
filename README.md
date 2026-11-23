@@ -167,6 +167,27 @@ sudo AGE_RECIPIENT=age1xxxxxxxx ./bootstrap/50-backup.sh
 
 VM の**外**から、公開 IP に何も開いていないことも確認する（例: `nmap -Pn -p- <公開IP>`）。
 
+## サブ LLM（Gemini API キー）
+
+GPT（Codex サブスク）が上限・障害で使えない時は、OpenClaw のモデルフォールバックで Gemini に切り替わる（`agents.defaults.model.fallbacks`）。
+
+1. AI Studio でサーバ用のキーを作る。**ウェブサイト（リファラー）制限のキーは使い回さない**（サーバからは必ず弾かれる）。制限するなら「IP アドレス」でサーバの出口 IP（IPv6 で出ているなら IPv6 も）を指定
+2. VPS の `~/.openclaw/.env` に `GEMINI_API_KEY=...` を追記（Windows で編集した場合は改行コード CR に注意）
+3. 切り分け:
+   ```bash
+   ./checks/gemini-diag.sh gemini-3.8-flash
+   ```
+   キー形式・出口 IP/地域・IPv4/IPv6 別の応答・エラー理由（`API_KEY_IP_ADDRESS_BLOCKED` / `API_KEY_HTTP_REFERRER_BLOCKED` / `User location is not supported` など）を表示し、対処を示す。キー本体は表示しない
+4. 反映:
+   ```bash
+   systemctl --user restart openclaw-gateway.service
+   ```
+   ```bash
+   openclaw models list --provider google --refresh
+   ```
+
+注意: 課金を有効にしていない AI Studio キー（無料枠）は、入力が Google の製品改善に使われる場合がある。秘密情報を含む作業はフォールバック先に流れうる点を踏まえて使う。
+
 ## 運用
 
 | やりたいこと | コマンド |
